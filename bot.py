@@ -8,8 +8,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-TOKEN = os.getenv("DISCORD_TOKEN", "MTU1ODgwOTM4ODc4ODIyNDA0MA.G7GZ3Y.j68ATDzV7BQ65MEUldALRIYcEqcrArpixa9aD4")
-DATA_FILE = Path("data.json")
+TOKEN = os.getenv("DISCORD_TOKEN", "YOUR_BOT_TOKEN_HERE")
+DATA_FILE = Path(os.getenv("DATA_FILE", "data.json"))
 HWID_COOLDOWN = 24 * 60 * 60  # seconds between HWID resets
 
 START_TIME = time.time()
@@ -209,13 +209,13 @@ async def setup_panel(
     script: str,
     role: discord.Role,
 ):
-    if name in data["panels"]:
-        return await interaction.response.send_message(
-            "❌ A panel with that name already exists.", ephemeral=True
-        )
+    await interaction.response.defer(ephemeral=True)
 
-    data["panels"][name] = {"description": description, "script": script, "role_id": role.id}
-    save(data)
+    if name in data["panels"]:
+        return await interaction.followup.send(
+            "❌ A panel with that name already exists. Use `/deletepanel` first.",
+            ephemeral=True,
+        )
 
     embed = discord.Embed(
         title=name, description=description, color=discord.Color.blurple()
@@ -223,9 +223,40 @@ async def setup_panel(
     embed.set_footer(text="Redeem your key first to unlock the other buttons.")
 
     view = PanelView(name)
+    try:
+        await interaction.channel.send(embed=embed, view=view)
+    except discord.Forbidden:
+        return await interaction.followup.send(
+            "❌ I can't send messages in this channel. Give me **View Channel**, "
+            "**Send Messages** and **Embed Links** here and try again.",
+            ephemeral=True,
+        )
+    except Exception as e:
+        return await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
+    # only save after the panel was posted successfully
+    data["panels"][name] = {"description": description, "script": script, "role_id": role.id}
+    save(data)
     bot.add_view(view)
-    await interaction.channel.send(embed=embed, view=view)
-    await interaction.response.send_message(f"✅ Panel **{name}** created.", ephemeral=True)
+    await interaction.followup.send(f"✅ Panel **{name}** created.", ephemeral=True)
+
+
+@bot.tree.command(name="deletepanel", description="Delete a panel and its keys")
+@app_commands.describe(panel="Panel to delete")
+@app_commands.autocomplete(panel=panel_autocomplete)
+@app_commands.default_permissions(administrator=True)
+async def delete_panel(interaction: discord.Interaction, panel: str):
+    if panel not in data["panels"]:
+        return await interaction.response.send_message("❌ Unknown panel.", ephemeral=True)
+    del data["panels"][panel]
+    data["keys"] = {k: v for k, v in data["keys"].items() if v["panel"] != panel}
+    for user_panels in data["users"].values():
+        user_panels.pop(panel, None)
+    save(data)
+    await interaction.response.send_message(
+        f"🗑️ Panel **{panel}** deleted. You can delete the old panel message manually.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="createkey", description="Generate keys for a panel")
