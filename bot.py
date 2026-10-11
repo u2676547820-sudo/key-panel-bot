@@ -8,8 +8,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-TOKEN = os.getenv("DISCORD_TOKEN", "YOUR_BOT_TOKEN_HERE")
-DATA_FILE = Path(os.getenv("DATA_FILE", "data.json"))
+TOKEN = os.getenv("DISCORD_TOKEN", "MTU1ODgwOTM4ODc4ODIyNDA0MA.G7GZ3Y.j68ATDzV7BQ65MEUldALRIYcEqcrArpixa9aD4")
+DATA_FILE = Path("data.json")
 HWID_COOLDOWN = 24 * 60 * 60  # seconds between HWID resets
 
 START_TIME = time.time()
