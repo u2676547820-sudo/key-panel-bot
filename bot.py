@@ -1,17 +1,22 @@
+import io
 import json
 import os
+import re
 import secrets
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-TOKEN = os.getenv("DISCORD_TOKEN", "MTU1ODgwOTM4ODc4ODIyNDA0MA.G86l00.Eke8iHk-2ZkevOvNAFtfBPdJOuBDRpR8lpBcgE")
+TOKEN = os.getenv("DISCORD_TOKEN", "YOUR_BOT_TOKEN_HERE")
 DATA_FILE = Path(os.getenv("DATA_FILE", "data.json"))
 HWID_COOLDOWN = 24 * 60 * 60  # seconds between HWID resets
 BRAND = "BananaHub"
+# Admins are never punished for leaks unless you set EXEMPT_ADMINS=false (for testing)
+EXEMPT_ADMINS = os.getenv("EXEMPT_ADMINS", "true").lower() != "false"
 
 DURATIONS = {
     "daily": 24 * 3600,
@@ -28,7 +33,7 @@ def load() -> dict:
     d = {}
     if DATA_FILE.exists():
         d = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-    for k in ("panels", "keys", "users", "banned"):
+    for k in ("panels", "keys", "users", "banned", "config", "appeals"):
         d.setdefault(k, {})
     return d
 
@@ -94,7 +99,51 @@ def ban_user_keys(user_id: int, reason: str):
     save(data)
 
 
-# ----------------------------- modal -----------------------------------
+def lift_user_ban(user_id: int):
+    data["banned"].pop(str(user_id), None)
+    for lic in data["users"].get(str(user_id), {}).values():
+        entry = data["keys"].get(lic["key"])
+        if entry:
+            entry["banned"] = False
+    for entry in data["keys"].values():
+        if entry.get("locked_to") == user_id:
+            entry["banned"] = False
+    save(data)
+
+
+# ----------------------------- logging ---------------------------------
+async def log_event(title: str, description: str, color: discord.Color | None = None):
+    cid = data["config"].get("log_channel")
+    if not cid:
+        return
+    channel = bot.get_channel(cid)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(cid)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=color or discord.Color.blurple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(text=BRAND)
+    try:
+        await channel.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
+# ----------------------------- panel embed -----------------------------
+def build_panel_embed(name: str) -> discord.Embed:
+    panel = data["panels"][name]
+    embed = discord.Embed(title=name, description=panel["description"], color=discord.Color.blurple())
+    embed.set_footer(text=f"{BRAND} • Redeem your key first to unlock the other buttons.")
+    return embed
+
+
+# ----------------------------- redeem modal ----------------------------
 class RedeemModal(discord.ui.Modal, title="Redeem Key"):
     key_input = discord.ui.TextInput(
         label="Your key",
@@ -159,6 +208,11 @@ class RedeemModal(discord.ui.Modal, title="Redeem Key"):
             "You can now use **Get Script**, **Get Role** and **Reset HWID**.",
             ephemeral=True,
         )
+        await log_event(
+            "🔑 Key redeemed",
+            f"{interaction.user.mention} (`{uid}`) redeemed a **{fmt_duration(duration)}** key on **{self.panel}**.",
+            discord.Color.green(),
+        )
 
 
 # ----------------------------- panel view ------------------------------
@@ -194,6 +248,9 @@ class PanelView(discord.ui.View):
         if not await self._require_key(interaction):
             return
         lic = get_license(interaction.user.id, self.panel)
+        if not lic.get("token"):  # licenses redeemed before the leak-protection update
+            lic["token"] = "BH-" + secrets.token_hex(8)
+            save(data)
         script = data["panels"][self.panel]["script"]
         # personal watermark: if this token ever shows up in a channel, the owner is banned
         marked = f"-- {lic['token']}\n{script}"
@@ -240,6 +297,11 @@ class PanelView(discord.ui.View):
         lic["hwid"] = None  # your script/API re-binds on next launch
         save(data)
         await interaction.response.send_message("✅ Your HWID has been reset.", ephemeral=True)
+        await log_event(
+            "🔄 HWID reset",
+            f"{interaction.user.mention} (`{interaction.user.id}`) reset their HWID on **{self.panel}**.",
+            discord.Color.orange(),
+        )
 
     async def stats(self, interaction: discord.Interaction):
         b: commands.Bot = interaction.client
@@ -272,6 +334,194 @@ class PanelView(discord.ui.View):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+# ----------------------------- appeal system ---------------------------
+class AppealModal(discord.ui.Modal, title="Unban Appeal"):
+    message = discord.ui.TextInput(
+        label="Why should we unban you?",
+        style=discord.TextStyle.paragraph,
+        placeholder="e.g. It was an accident, I did not know...",
+        min_length=5,
+        max_length=1000,
+    )
+
+    def __init__(self, uid: int, gid: int):
+        super().__init__()
+        self.uid = uid
+        self.gid = gid
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not data["config"].get("log_channel"):
+            return await interaction.response.send_message(
+                "❌ Appeals are currently unavailable. Please contact the staff directly.",
+                ephemeral=True,
+            )
+        data["appeals"][str(self.uid)] = {
+            "status": "pending",
+            "text": self.message.value,
+            "guild_id": self.gid,
+            "at": int(time.time()),
+        }
+        save(data)
+
+        embed = discord.Embed(
+            title="📨 New Unban Appeal",
+            color=discord.Color.gold(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(name="User", value=f"<@{self.uid}> (`{self.uid}`)", inline=False)
+        embed.add_field(
+            name="Ban reason",
+            value=data["banned"].get(str(self.uid), {}).get("reason", "Unknown"),
+            inline=False,
+        )
+        embed.add_field(name="Appeal", value=self.message.value, inline=False)
+        embed.set_footer(text=BRAND)
+
+        view = discord.ui.View(timeout=None)
+        view.add_item(DecisionButton("ok", self.uid, self.gid))
+        view.add_item(DecisionButton("no", self.uid, self.gid))
+
+        channel = bot.get_channel(data["config"]["log_channel"])
+        if channel is None:
+            channel = await bot.fetch_channel(data["config"]["log_channel"])
+        await channel.send(embed=embed, view=view)
+        await interaction.response.send_message(
+            "✅ Your appeal was sent to the staff. You will get a DM with the decision.",
+            ephemeral=True,
+        )
+
+
+class AppealButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"appeal:(?P<uid>[0-9]+):(?P<gid>[0-9]+)",
+):
+    def __init__(self, uid: int, gid: int):
+        super().__init__(
+            discord.ui.Button(
+                label="Unban Appeal",
+                style=discord.ButtonStyle.primary,
+                emoji="📨",
+                custom_id=f"appeal:{uid}:{gid}",
+            )
+        )
+        self.uid = uid
+        self.gid = gid
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match: re.Match[str], /):
+        return cls(int(match["uid"]), int(match["gid"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.uid:
+            return await interaction.response.send_message("❌ This appeal is not yours.", ephemeral=True)
+        existing = data["appeals"].get(str(self.uid))
+        if existing and existing["status"] == "pending":
+            return await interaction.response.send_message(
+                "⏳ You already have a pending appeal. Please wait for the staff.", ephemeral=True
+            )
+        if existing and existing["status"] == "denied":
+            return await interaction.response.send_message(
+                "🚫 Your appeal was already denied.", ephemeral=True
+            )
+        await interaction.response.send_modal(AppealModal(self.uid, self.gid))
+
+
+class DecisionButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"appeal_(?P<act>ok|no):(?P<uid>[0-9]+):(?P<gid>[0-9]+)",
+):
+    def __init__(self, act: str, uid: int, gid: int):
+        accept = act == "ok"
+        super().__init__(
+            discord.ui.Button(
+                label="Accept & Unban" if accept else "Deny",
+                style=discord.ButtonStyle.success if accept else discord.ButtonStyle.danger,
+                emoji="✅" if accept else "❌",
+                custom_id=f"appeal_{act}:{uid}:{gid}",
+            )
+        )
+        self.act = act
+        self.uid = uid
+        self.gid = gid
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match: re.Match[str], /):
+        return cls(match["act"], int(match["uid"]), int(match["gid"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.guild is None or not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+
+        appeal = data["appeals"].setdefault(str(self.uid), {})
+        embed = interaction.message.embeds[0]
+        try:
+            user = await interaction.client.fetch_user(self.uid)
+        except discord.HTTPException:
+            user = None
+
+        if self.act == "ok":
+            guild = interaction.client.get_guild(self.gid) or interaction.guild
+            try:
+                await guild.unban(discord.Object(id=self.uid), reason=f"{BRAND}: appeal accepted")
+            except discord.NotFound:
+                pass  # was not banned on the server
+            except discord.Forbidden:
+                return await interaction.response.send_message(
+                    "❌ I can't unban (missing Ban Members permission).", ephemeral=True
+                )
+            lift_user_ban(self.uid)
+            appeal["status"] = "accepted"
+            save(data)
+            embed.color = discord.Color.green()
+            embed.add_field(name="Decision", value=f"✅ Accepted by {interaction.user.mention}", inline=False)
+
+            invite_text = ""
+            try:
+                invite = await interaction.channel.create_invite(max_uses=1, max_age=86400, unique=True)
+                invite_text = f"\nRejoin here (valid 24h): {invite.url}"
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+            if user:
+                try:
+                    await user.send(f"✅ Your unban appeal was **accepted**. You were unbanned.{invite_text}")
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+        else:
+            appeal["status"] = "denied"
+            save(data)
+            embed.color = discord.Color.red()
+            embed.add_field(name="Decision", value=f"❌ Denied by {interaction.user.mention}", inline=False)
+            if user:
+                try:
+                    await user.send("❌ Your unban appeal was **denied**.")
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+
+        await interaction.response.edit_message(embed=embed, view=None)
+
+
+async def dm_banned(user_id: int, guild: discord.Guild, reason: str) -> bool:
+    """DM the user BEFORE the ban (afterwards the bot may no longer share a server with them)."""
+    try:
+        user = await bot.fetch_user(user_id)
+        embed = discord.Embed(
+            title="🔨 You have been banned",
+            description=(
+                f"You got banned from **{guild.name}**.\n\n"
+                f"**Reason:** {reason}\n\n"
+                "If you think this was a mistake, please open an appeal with the button below."
+            ),
+            color=discord.Color.red(),
+        )
+        embed.set_footer(text=BRAND)
+        view = discord.ui.View(timeout=None)
+        view.add_item(AppealButton(user_id, guild.id))
+        await user.send(embed=embed, view=view)
+        return True
+    except (discord.Forbidden, discord.HTTPException):
+        return False
+
+
 # ----------------------------- bot -------------------------------------
 class Bot(commands.Bot):
     def __init__(self):
@@ -280,6 +530,7 @@ class Bot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
+        self.add_dynamic_items(AppealButton, DecisionButton)
         for name in data["panels"]:
             self.add_view(PanelView(name))
         expiry_loop.start()
@@ -305,11 +556,44 @@ async def expiry_loop():
 
 
 # ----------------------------- leak detection --------------------------
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot or message.guild is None or not message.content:
+async def collect_text(message: discord.Message) -> str:
+    """Gather every piece of text a message carries (content, forwards, embeds, text files)."""
+    parts = [message.content or ""]
+
+    def add_embeds(embeds):
+        for e in embeds:
+            parts.append(e.title or "")
+            parts.append(e.description or "")
+            for f in e.fields:
+                parts.append(f.name or "")
+                parts.append(f.value or "")
+
+    add_embeds(message.embeds)
+    attachments = list(message.attachments)
+
+    # Discord's "Forward" feature stores the text in snapshots
+    for snap in getattr(message, "message_snapshots", None) or []:
+        parts.append(getattr(snap, "content", "") or "")
+        add_embeds(getattr(snap, "embeds", []) or [])
+        attachments.extend(getattr(snap, "attachments", []) or [])
+
+    for att in attachments:
+        name = (att.filename or "").lower()
+        if att.size <= 500_000 and name.endswith((".txt", ".lua", ".luau", ".md", ".json")):
+            try:
+                parts.append((await att.read()).decode("utf-8", errors="ignore"))
+            except (discord.HTTPException, discord.NotFound):
+                pass
+    return "\n".join(parts)
+
+
+async def check_leak(message: discord.Message):
+    if message.author.bot or message.guild is None:
         return
-    content = message.content
+    content = await collect_text(message)
+    if not content.strip():
+        return
+
     for uid, panels in data["users"].items():
         for lic in panels.values():
             token = lic.get("token")
@@ -318,8 +602,14 @@ async def on_message(message: discord.Message):
 
             owner_id = int(uid)
             member = message.guild.get_member(owner_id)
-            # never punish admins (e.g. while testing)
-            if member and member.guild_permissions.administrator:
+            if EXEMPT_ADMINS and member and member.guild_permissions.administrator:
+                try:
+                    await message.channel.send(
+                        f"⚠️ Leak detected from <@{owner_id}>, but admins are exempt "
+                        f"(test with a non-admin account or set EXEMPT_ADMINS=false)."
+                    )
+                except discord.HTTPException:
+                    pass
                 return
 
             try:
@@ -327,8 +617,11 @@ async def on_message(message: discord.Message):
             except (discord.Forbidden, discord.NotFound):
                 pass
 
+            reason = "You shared the script publicly (sent it to someone else)."
             ban_user_keys(owner_id, f"Leaked script (found in #{message.channel})")
             await strip_roles(owner_id)
+
+            dm_ok = await dm_banned(owner_id, message.guild, reason)  # DM first, then ban
             try:
                 await message.guild.ban(
                     discord.Object(id=owner_id),
@@ -336,15 +629,34 @@ async def on_message(message: discord.Message):
                     delete_message_days=0,
                 )
                 outcome = "banned from the server"
-            except (discord.Forbidden, discord.HTTPException):
-                outcome = "key banned (I lack permission to ban the user)"
+            except (discord.Forbidden, discord.HTTPException) as e:
+                outcome = (
+                    f"key-banned, but I could not ban the user ({type(e).__name__}: "
+                    "give me Ban Members and put my role above theirs)"
+                )
             try:
                 await message.channel.send(
                     f"🚨 A leaked script was detected. <@{owner_id}> was {outcome}."
                 )
             except discord.HTTPException:
                 pass
+            await log_event(
+                "🚨 Script leak",
+                f"<@{owner_id}> (`{owner_id}`) leaked the script in {message.channel.mention}.\n"
+                f"Result: {outcome}.\nDM sent: {'yes' if dm_ok else 'no (DMs closed)'}",
+                discord.Color.red(),
+            )
             return
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    await check_leak(message)
+
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    await check_leak(after)
 
 
 # ----------------------------- commands --------------------------------
@@ -356,7 +668,7 @@ async def panel_autocomplete(interaction: discord.Interaction, current: str):
     ][:25]
 
 
-@bot.tree.command(name="setuppanel", description="Create a panel with buttons in this channel")
+@bot.tree.command(name="setuppanel", description="Create/configure a panel (then post it with /sendpanel)")
 @app_commands.describe(
     name="Unique panel name",
     description="Text shown on the panel",
@@ -371,33 +683,44 @@ async def setup_panel(
     script: str,
     role: discord.Role,
 ):
-    await interaction.response.defer(ephemeral=True)
-
     if name in data["panels"]:
-        return await interaction.followup.send(
+        return await interaction.response.send_message(
             "❌ A panel with that name already exists. Use `/deletepanel` first.",
             ephemeral=True,
         )
-
-    embed = discord.Embed(title=name, description=description, color=discord.Color.blurple())
-    embed.set_footer(text=f"{BRAND} • Redeem your key first to unlock the other buttons.")
-
-    view = PanelView(name)
-    try:
-        await interaction.channel.send(embed=embed, view=view)
-    except discord.Forbidden:
-        return await interaction.followup.send(
-            "❌ I can't send messages in this channel. Give me **View Channel**, "
-            "**Send Messages** and **Embed Links** here and try again.",
-            ephemeral=True,
-        )
-    except Exception as e:
-        return await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
-
     data["panels"][name] = {"description": description, "script": script, "role_id": role.id}
     save(data)
-    bot.add_view(view)
-    await interaction.followup.send(f"✅ Panel **{name}** created.", ephemeral=True)
+    bot.add_view(PanelView(name))
+    await interaction.response.send_message(
+        f"✅ Panel **{name}** saved. Post it with `/sendpanel panel:{name}`.", ephemeral=True
+    )
+    await log_event("🧩 Panel created", f"{interaction.user.mention} created panel **{name}**.")
+
+
+@bot.tree.command(name="sendpanel", description="Post a saved panel into a channel")
+@app_commands.describe(panel="The panel you set up", channel="Where to post it (default: this channel)")
+@app_commands.autocomplete(panel=panel_autocomplete)
+@app_commands.default_permissions(administrator=True)
+async def send_panel(
+    interaction: discord.Interaction,
+    panel: str,
+    channel: discord.TextChannel | None = None,
+):
+    if panel not in data["panels"]:
+        return await interaction.response.send_message("❌ Unknown panel.", ephemeral=True)
+    channel = channel or interaction.channel
+    try:
+        await channel.send(embed=build_panel_embed(panel), view=PanelView(panel))
+    except discord.Forbidden:
+        return await interaction.response.send_message(
+            f"❌ I can't send messages in {channel.mention}. Give me **View Channel**, "
+            "**Send Messages** and **Embed Links** there.",
+            ephemeral=True,
+        )
+    await interaction.response.send_message(
+        f"✅ Panel **{panel}** posted in {channel.mention}.", ephemeral=True
+    )
+    await log_event("📤 Panel sent", f"{interaction.user.mention} posted **{panel}** in {channel.mention}.")
 
 
 @bot.tree.command(name="deletepanel", description="Delete a panel and its keys")
@@ -416,6 +739,26 @@ async def delete_panel(interaction: discord.Interaction, panel: str):
         f"🗑️ Panel **{panel}** deleted. You can delete the old panel message manually.",
         ephemeral=True,
     )
+    await log_event("🗑️ Panel deleted", f"{interaction.user.mention} deleted panel **{panel}**.", discord.Color.orange())
+
+
+@bot.tree.command(name="setlogchannel", description="Set the channel for logs and unban appeals")
+@app_commands.describe(channel="The log channel")
+@app_commands.default_permissions(administrator=True)
+async def set_log_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    try:
+        await channel.send(embed=discord.Embed(
+            title="✅ Log channel set",
+            description="Logs and unban appeals will appear here.",
+            color=discord.Color.green(),
+        ))
+    except discord.Forbidden:
+        return await interaction.response.send_message(
+            f"❌ I can't send messages in {channel.mention}.", ephemeral=True
+        )
+    data["config"]["log_channel"] = channel.id
+    save(data)
+    await interaction.response.send_message(f"✅ Log channel set to {channel.mention}.", ephemeral=True)
 
 
 @bot.tree.command(name="createkey", description="Generate keys for a panel")
@@ -466,13 +809,145 @@ async def create_key(
         + "\n```",
         ephemeral=True,
     )
+    await log_event(
+        "🔑 Keys created",
+        f"{interaction.user.mention} created **{amount}x {duration.name}** key(s) for **{panel}**"
+        + (f", locked to {user.mention}." if user else "."),
+    )
+
+
+def key_status(entry: dict) -> str:
+    if entry.get("banned"):
+        return "🚫 Banned"
+    if entry["used_by"] is not None:
+        return "✅ Redeemed"
+    return "🟢 Unused"
+
+
+@bot.tree.command(name="keyinfo", description="Show info about a key or a user")
+@app_commands.describe(key="The key to look up", user="Or: the user to look up")
+@app_commands.default_permissions(administrator=True)
+async def key_info(
+    interaction: discord.Interaction,
+    key: str | None = None,
+    user: discord.User | None = None,
+):
+    if not key and not user:
+        return await interaction.response.send_message(
+            "❌ Provide a `key` or a `user`.", ephemeral=True
+        )
+
+    embed = discord.Embed(color=discord.Color.blurple())
+    embed.set_footer(text=BRAND)
+
+    if key:
+        key = key.strip()
+        entry = data["keys"].get(key)
+        if not entry:
+            return await interaction.response.send_message("❌ Key not found.", ephemeral=True)
+        embed.title = "🔎 Key info"
+        embed.add_field(name="Key", value=f"`{key}`", inline=False)
+        embed.add_field(name="Panel", value=entry["panel"], inline=True)
+        embed.add_field(name="Type", value=fmt_duration(entry.get("duration", "lifetime")), inline=True)
+        embed.add_field(name="Status", value=key_status(entry), inline=True)
+        embed.add_field(
+            name="Locked to",
+            value=f"<@{entry['locked_to']}>" if entry.get("locked_to") else "Anyone",
+            inline=True,
+        )
+        if entry["used_by"] is not None:
+            embed.add_field(name="Redeemed by", value=f"<@{entry['used_by']}>", inline=True)
+            lic = get_license(entry["used_by"], entry["panel"])
+            if lic and lic.get("key") == key:
+                exp = lic.get("expires_at")
+                embed.add_field(
+                    name="Expires",
+                    value=f"<t:{exp}:R>" if exp else "Never (lifetime)",
+                    inline=True,
+                )
+        if entry.get("created_at"):
+            embed.add_field(name="Created", value=f"<t:{entry['created_at']}:R>", inline=True)
+    else:
+        embed.title = f"🔎 User info — {user}"
+        ban = data["banned"].get(str(user.id))
+        embed.add_field(
+            name="Banned",
+            value=f"🚫 Yes — {ban['reason']}" if ban else "No",
+            inline=False,
+        )
+        licenses = data["users"].get(str(user.id), {})
+        if not licenses:
+            embed.add_field(name="Licenses", value="None", inline=False)
+        for pname, lic in licenses.items():
+            exp = lic.get("expires_at")
+            embed.add_field(
+                name=pname,
+                value=(
+                    f"Key: `{lic['key']}`\n"
+                    f"Type: {fmt_duration(lic.get('duration', 'lifetime'))}\n"
+                    f"Expires: {f'<t:{exp}:R>' if exp else 'Never'}"
+                ),
+                inline=False,
+            )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="listkeys", description="List the keys of a panel")
+@app_commands.describe(panel="Which panel", status="Which keys to show")
+@app_commands.choices(
+    status=[
+        app_commands.Choice(name="Unused", value="unused"),
+        app_commands.Choice(name="Redeemed", value="used"),
+        app_commands.Choice(name="Banned", value="banned"),
+        app_commands.Choice(name="All", value="all"),
+    ]
+)
+@app_commands.autocomplete(panel=panel_autocomplete)
+@app_commands.default_permissions(administrator=True)
+async def list_keys(
+    interaction: discord.Interaction,
+    panel: str,
+    status: app_commands.Choice[str] | None = None,
+):
+    if panel not in data["panels"]:
+        return await interaction.response.send_message("❌ Unknown panel.", ephemeral=True)
+    mode = status.value if status else "unused"
+
+    lines = []
+    for key, entry in data["keys"].items():
+        if entry["panel"] != panel:
+            continue
+        if mode == "unused" and (entry["used_by"] is not None or entry.get("banned")):
+            continue
+        if mode == "used" and entry["used_by"] is None:
+            continue
+        if mode == "banned" and not entry.get("banned"):
+            continue
+        owner = entry.get("used_by") or entry.get("locked_to")
+        lines.append(
+            f"{key} | {fmt_duration(entry.get('duration', 'lifetime')):<8} | "
+            f"{key_status(entry)[2:]:<8} | {owner if owner else '-'}"
+        )
+
+    if not lines:
+        return await interaction.response.send_message("ℹ️ No keys found.", ephemeral=True)
+
+    header = f"{panel} — {mode} keys ({len(lines)})\nKEY | TYPE | STATUS | USER-ID\n"
+    text = header + "\n".join(lines)
+    if len(text) < 1800:
+        await interaction.response.send_message(f"```\n{text}\n```", ephemeral=True)
+    else:
+        file = discord.File(io.BytesIO(text.encode("utf-8")), filename=f"{panel}_{mode}_keys.txt")
+        await interaction.response.send_message(
+            f"📄 {len(lines)} keys (too long for a message):", file=file, ephemeral=True
+        )
 
 
 @bot.tree.command(name="bankey", description="Ban a user's keys (and optionally the user)")
 @app_commands.describe(
     user="The Discord user to ban",
     reason="Reason (optional)",
-    ban_from_server="Also ban the user from this server",
+    ban_from_server="Also ban the user from this server (they get a DM with an appeal button)",
 )
 @app_commands.default_permissions(administrator=True)
 async def ban_key(
@@ -487,6 +962,7 @@ async def ban_key(
 
     extra = ""
     if ban_from_server and interaction.guild:
+        await dm_banned(user.id, interaction.guild, reason)  # DM first, then ban
         try:
             await interaction.guild.ban(user, reason=f"{BRAND}: {reason}", delete_message_days=0)
             extra = " and banned from the server"
@@ -495,24 +971,26 @@ async def ban_key(
     await interaction.followup.send(
         f"🔨 {user.mention}'s keys were banned{extra}.\nReason: {reason}", ephemeral=True
     )
+    await log_event(
+        "🔨 Key ban",
+        f"{interaction.user.mention} banned {user.mention} (`{user.id}`){extra}.\nReason: {reason}",
+        discord.Color.red(),
+    )
 
 
 @bot.tree.command(name="unbankey", description="Lift a key ban from a user")
 @app_commands.describe(user="The Discord user to unban")
 @app_commands.default_permissions(administrator=True)
 async def unban_key(interaction: discord.Interaction, user: discord.User):
-    data["banned"].pop(str(user.id), None)
-    for lic in data["users"].get(str(user.id), {}).values():
-        entry = data["keys"].get(lic["key"])
-        if entry:
-            entry["banned"] = False
-    for entry in data["keys"].values():
-        if entry.get("locked_to") == user.id:
-            entry["banned"] = False
-    save(data)
+    lift_user_ban(user.id)
     await interaction.response.send_message(
         f"✅ Key ban lifted for {user.mention}. (Server bans must be lifted in Server Settings → Bans.)",
         ephemeral=True,
+    )
+    await log_event(
+        "✅ Key unban",
+        f"{interaction.user.mention} lifted the key ban of {user.mention} (`{user.id}`).",
+        discord.Color.green(),
     )
 
 
