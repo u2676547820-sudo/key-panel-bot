@@ -56,6 +56,8 @@ def license_error(user_id: int, panel: str):
     lic = get_license(user_id, panel)
     if not lic:
         return "🔒 You need to **Redeem Key** first!"
+    if lic.get("deleted"):
+        return "🗑️ Your Key got Successfully Deleted. Please buy a New Key!"
     entry = data["keys"].get(lic["key"])
     if entry is None or entry.get("banned"):
         return "🚫 Your key has been banned."
@@ -196,10 +198,14 @@ class RedeemModal(discord.ui.Modal, title="Redeem Key"):
             return await interaction.response.send_message(
                 "❌ This key has already been redeemed.", ephemeral=True
             )
-        if get_license(uid, self.panel):
-            return await interaction.response.send_message(
-                "⚠️ You already have a key redeemed on this panel.", ephemeral=True
-            )
+        existing = get_license(uid, self.panel)
+        if existing:
+            ex_exp = existing.get("expires_at")
+            replaceable = existing.get("deleted") or (ex_exp and ex_exp < time.time())
+            if not replaceable:
+                return await interaction.response.send_message(
+                    "⚠️ You already have a key redeemed on this panel.", ephemeral=True
+                )
 
         duration = entry.get("duration", "lifetime")
         seconds = DURATIONS.get(duration)
@@ -355,7 +361,7 @@ class PanelView(discord.ui.View):
         embed.add_field(name="Banned keys", value=str(banned), inline=True)
 
         lic = get_license(interaction.user.id, self.panel)
-        if lic:
+        if lic and not lic.get("deleted"):
             exp = lic.get("expires_at")
             embed.add_field(
                 name="Your key",
@@ -532,6 +538,34 @@ class DecisionButton(
         await interaction.response.edit_message(embed=embed, view=None)
 
 
+class OrphanPanelButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"panel:(?P<name>.+):(?P<act>redeem|script|role|hwid|stats)",
+):
+    """Catches clicks on panel messages whose panel is not registered (e.g. data was reset)."""
+
+    def __init__(self, name: str, act: str):
+        super().__init__(discord.ui.Button(label=act, custom_id=f"panel:{name}:{act}"))
+        self.name = name
+        self.act = act
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match: re.Match[str], /):
+        return cls(match["name"], match["act"])
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.name in data["panels"]:
+            view = PanelView(self.name)
+            if await view.interaction_check(interaction):
+                await getattr(view, self.act)(interaction)
+            return
+        await interaction.response.send_message(
+            f"⚠️ The panel **{self.name}** is not active anymore (deleted or the bot data was reset).\n"
+            "An admin only needs to run `/setuppanel` again with the **same name** — this message then works again.",
+            ephemeral=True,
+        )
+
+
 async def dm_banned(user_id: int, guild: discord.Guild, reason: str) -> bool:
     """DM the user BEFORE the ban (afterwards the bot may no longer share a server with them)."""
     try:
@@ -562,11 +596,15 @@ class Bot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        self.add_dynamic_items(AppealButton, DecisionButton)
+        self.add_dynamic_items(AppealButton, DecisionButton, OrphanPanelButton)
         for name in data["panels"]:
             self.add_view(PanelView(name))
         expiry_loop.start()
         await self.tree.sync()
+        print(
+            f"Loaded {len(data['panels'])} panels, {len(data['keys'])} keys, "
+            f"{len(data['users'])} users from {DATA_FILE.resolve()}"
+        )
 
 
 bot = Bot()
@@ -851,6 +889,8 @@ async def create_key(
 def key_status(entry: dict) -> str:
     if entry.get("banned"):
         return "🚫 Banned"
+    if entry.get("deleted"):
+        return "❌ Deleted"
     if entry["used_by"] is not None:
         return "✅ Redeemed"
     return "🟢 Unused"
@@ -918,6 +958,7 @@ async def key_info(
                     f"Key: `{lic['key']}`\n"
                     f"Type: {fmt_duration(lic.get('duration', 'lifetime'))}\n"
                     f"Expires: {f'<t:{exp}:R>' if exp else 'Never'}"
+                    + ("\nStatus: ❌ Deleted" if lic.get("deleted") else "")
                 ),
                 inline=False,
             )
@@ -1024,6 +1065,209 @@ async def unban_key(interaction: discord.Interaction, user: discord.User):
         f"{interaction.user.mention} lifted the key ban of {user.mention} (`{user.id}`).",
         discord.Color.green(),
     )
+
+
+@bot.tree.command(name="deletekey", description="Delete a user's key on a panel")
+@app_commands.describe(user="The user whose key should be deleted", panel="The panel")
+@app_commands.autocomplete(panel=panel_autocomplete)
+@app_commands.default_permissions(administrator=True)
+async def delete_key(interaction: discord.Interaction, user: discord.User, panel: str):
+    if panel not in data["panels"]:
+        return await interaction.response.send_message("❌ Unknown panel.", ephemeral=True)
+    lic = get_license(user.id, panel)
+    if not lic or lic.get("deleted"):
+        return await interaction.response.send_message(
+            f"❌ {user.mention} has no active key on **{panel}**.", ephemeral=True
+        )
+    lic["deleted"] = True
+    lic["deleted_at"] = int(time.time())
+    entry = data["keys"].get(lic["key"])
+    if entry:
+        entry["deleted"] = True
+    save(data)
+    await strip_roles(user.id, only_panel=panel)
+    await interaction.response.send_message(
+        f"🗑️ Deleted {user.mention}'s key on **{panel}**. Buttons now show: "
+        "*Your Key got Successfully Deleted. Please buy a New Key!*",
+        ephemeral=True,
+    )
+    await log_event(
+        "🗑️ Key deleted",
+        f"{interaction.user.mention} deleted the key of {user.mention} (`{user.id}`) on **{panel}**.",
+        discord.Color.orange(),
+    )
+
+
+@bot.tree.command(name="extendkey", description="Extend a user's key by a number of days")
+@app_commands.describe(user="The key owner", panel="The panel", days="Days to add")
+@app_commands.autocomplete(panel=panel_autocomplete)
+@app_commands.default_permissions(administrator=True)
+async def extend_key(
+    interaction: discord.Interaction,
+    user: discord.User,
+    panel: str,
+    days: app_commands.Range[int, 1, 3650],
+):
+    lic = get_license(user.id, panel)
+    if not lic or lic.get("deleted"):
+        return await interaction.response.send_message(
+            f"❌ {user.mention} has no active key on **{panel}**.", ephemeral=True
+        )
+    if not lic.get("expires_at"):
+        return await interaction.response.send_message(
+            "ℹ️ That is a Lifetime key — nothing to extend.", ephemeral=True
+        )
+    lic["expires_at"] = int(max(lic["expires_at"], time.time()) + days * 86400)
+    lic["role_removed"] = False
+    save(data)
+    await interaction.response.send_message(
+        f"⏩ {user.mention}'s key on **{panel}** extended by **{days}** day(s). "
+        f"New expiry: <t:{lic['expires_at']}:F>",
+        ephemeral=True,
+    )
+    await log_event(
+        "⏩ Key extended",
+        f"{interaction.user.mention} extended {user.mention}'s key on **{panel}** by {days} day(s).",
+    )
+
+
+@bot.tree.command(name="resethwid", description="Reset a user's HWID (ignores the cooldown)")
+@app_commands.describe(user="The key owner", panel="The panel")
+@app_commands.autocomplete(panel=panel_autocomplete)
+@app_commands.default_permissions(administrator=True)
+async def admin_reset_hwid(interaction: discord.Interaction, user: discord.User, panel: str):
+    lic = get_license(user.id, panel)
+    if not lic or lic.get("deleted"):
+        return await interaction.response.send_message(
+            f"❌ {user.mention} has no active key on **{panel}**.", ephemeral=True
+        )
+    lic["hwid"] = None
+    lic["hwid_reset_at"] = 0
+    save(data)
+    await interaction.response.send_message(
+        f"🔄 HWID of {user.mention} on **{panel}** was reset.", ephemeral=True
+    )
+    await log_event(
+        "🔄 HWID reset (admin)",
+        f"{interaction.user.mention} reset the HWID of {user.mention} on **{panel}**.",
+        discord.Color.orange(),
+    )
+
+
+@bot.tree.command(name="panels", description="Show all panels with their key numbers")
+@app_commands.default_permissions(administrator=True)
+async def list_panels(interaction: discord.Interaction):
+    if not data["panels"]:
+        return await interaction.response.send_message(
+            "ℹ️ No panels yet. Create one with `/setuppanel`.", ephemeral=True
+        )
+    embed = discord.Embed(title="🧩 Panels", color=discord.Color.blurple())
+    embed.set_footer(text=BRAND)
+    for name, panel in data["panels"].items():
+        keys = [k for k in data["keys"].values() if k["panel"] == name]
+        unused = sum(1 for k in keys if k["used_by"] is None and not k.get("banned"))
+        redeemed = sum(1 for k in keys if k["used_by"] is not None and not k.get("deleted"))
+        banned = sum(1 for k in keys if k.get("banned"))
+        deleted = sum(1 for k in keys if k.get("deleted"))
+        role = f"<@&{panel['role_id']}>" if panel.get("role_id") else "—"
+        embed.add_field(
+            name=name,
+            value=(
+                f"Role: {role}\nKeys: **{len(keys)}** "
+                f"(🟢 {unused} unused • ✅ {redeemed} redeemed • 🚫 {banned} banned • ❌ {deleted} deleted)"
+            ),
+            inline=False,
+        )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="adminstats", description="Detailed statistics about keys and users")
+@app_commands.default_permissions(administrator=True)
+async def admin_stats(interaction: discord.Interaction):
+    now = time.time()
+    active = {t: 0 for t in DURATIONS}
+    expiring = 0
+    redeemed_week = 0
+    for panels in data["users"].values():
+        for lic in panels.values():
+            if lic.get("redeemed_at", 0) > now - 7 * 86400:
+                redeemed_week += 1
+            if lic.get("deleted"):
+                continue
+            exp = lic.get("expires_at")
+            if exp and exp < now:
+                continue
+            active[lic.get("duration", "lifetime")] = active.get(lic.get("duration", "lifetime"), 0) + 1
+            if exp and exp - now < 86400:
+                expiring += 1
+    pending = sum(1 for a in data["appeals"].values() if a.get("status") == "pending")
+
+    embed = discord.Embed(title=f"📈 {BRAND} — Admin stats", color=discord.Color.blurple())
+    embed.add_field(
+        name="Active licenses",
+        value="\n".join(f"{fmt_duration(t)}: **{n}**" for t, n in active.items()),
+        inline=True,
+    )
+    embed.add_field(
+        name="Overview",
+        value=(
+            f"Panels: **{len(data['panels'])}**\n"
+            f"Keys total: **{len(data['keys'])}**\n"
+            f"Redeemed (7 days): **{redeemed_week}**\n"
+            f"Expiring in 24h: **{expiring}**\n"
+            f"Banned users: **{len(data['banned'])}**\n"
+            f"Pending appeals: **{pending}**"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Panel status",
+        value="🟢 Online" if panels_online() else "🔴 Offline",
+        inline=False,
+    )
+    embed.set_footer(text=BRAND)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="backup", description="Download a backup of all bot data (keys, users, panels)")
+@app_commands.default_permissions(administrator=True)
+async def backup(interaction: discord.Interaction):
+    payload = json.dumps(data, indent=2).encode("utf-8")
+    file = discord.File(io.BytesIO(payload), filename=f"{BRAND.lower()}_backup_{int(time.time())}.json")
+    await interaction.response.send_message(
+        "💾 Backup created. Keep this file private — it contains every key.",
+        file=file,
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="restore", description="Restore bot data from a backup file")
+@app_commands.describe(file="A backup .json created with /backup")
+@app_commands.default_permissions(administrator=True)
+async def restore(interaction: discord.Interaction, file: discord.Attachment):
+    await interaction.response.defer(ephemeral=True)
+    if file.size > 5_000_000:
+        return await interaction.followup.send("❌ File too large.", ephemeral=True)
+    try:
+        new = json.loads((await file.read()).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, discord.HTTPException):
+        return await interaction.followup.send("❌ That is not a valid JSON file.", ephemeral=True)
+    if not isinstance(new, dict) or not all(k in new for k in ("panels", "keys", "users")):
+        return await interaction.followup.send("❌ That is not a valid backup file.", ephemeral=True)
+    data.clear()
+    data.update(new)
+    for k in ("panels", "keys", "users", "banned", "config", "appeals"):
+        data.setdefault(k, {})
+    save(data)
+    for name in data["panels"]:
+        bot.add_view(PanelView(name))
+    await apply_presence()
+    await interaction.followup.send(
+        f"✅ Restored **{len(data['panels'])}** panels, **{len(data['keys'])}** keys, "
+        f"**{len(data['users'])}** users. Old panel messages work again.",
+        ephemeral=True,
+    )
+    await log_event("♻️ Data restored", f"{interaction.user.mention} restored a backup.", discord.Color.orange())
 
 
 @bot.tree.command(name="statuspanelbot", description="Set the panel status (Online / Offline)")
