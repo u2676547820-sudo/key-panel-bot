@@ -69,6 +69,21 @@ def fmt_duration(d: str) -> str:
     return d.capitalize()
 
 
+def panels_online() -> bool:
+    return data["config"].get("panels_online", True)
+
+
+async def apply_presence():
+    """Show the panel status in the bot's Discord presence."""
+    if panels_online():
+        await bot.change_presence(status=discord.Status.online, activity=None)
+    else:
+        await bot.change_presence(
+            status=discord.Status.dnd,
+            activity=discord.Game(name="Panels offline"),
+        )
+
+
 async def strip_roles(user_id: int, only_panel: str | None = None):
     """Remove the panel role(s) from a user on every guild the bot is in."""
     for pname, panel in data["panels"].items():
@@ -227,6 +242,19 @@ class PanelView(discord.ui.View):
         self.add_item(self._btn("Reset HWID", discord.ButtonStyle.danger, "🔄", "hwid", self.hwid))
         self.add_item(self._btn("Get Stats", discord.ButtonStyle.secondary, "📊", "stats", self.stats))
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """While the panels are offline only 'Get Stats' works."""
+        if panels_online():
+            return True
+        custom_id = (interaction.data or {}).get("custom_id", "")
+        if custom_id.endswith(":stats"):
+            return True
+        await interaction.response.send_message(
+            "🔴 The panel is currently **offline**. Only **Get Stats** is available right now.",
+            ephemeral=True,
+        )
+        return False
+
     def _btn(self, label, style, emoji, cid, callback):
         b = discord.ui.Button(
             label=label, style=style, emoji=emoji, custom_id=f"panel:{self.panel}:{cid}"
@@ -314,7 +342,11 @@ class PanelView(discord.ui.View):
         m, s = divmod(r, 60)
 
         embed = discord.Embed(title=f"📊 {BRAND} Stats", color=discord.Color.blurple())
-        embed.add_field(name="Status", value="🟢 Online", inline=True)
+        embed.add_field(
+            name="Panel status",
+            value="🟢 Online" if panels_online() else "🔴 Offline",
+            inline=True,
+        )
         embed.add_field(name="Latency", value=f"{round(b.latency * 1000)} ms", inline=True)
         embed.add_field(name="Uptime", value=f"{d}d {h}h {m}m {s}s", inline=True)
         embed.add_field(name="Servers", value=str(len(b.guilds)), inline=True)
@@ -994,9 +1026,35 @@ async def unban_key(interaction: discord.Interaction, user: discord.User):
     )
 
 
+@bot.tree.command(name="statuspanelbot", description="Set the panel status (Online / Offline)")
+@app_commands.describe(status="Online = everything works, Offline = only Get Stats works")
+@app_commands.choices(
+    status=[
+        app_commands.Choice(name="Online", value="online"),
+        app_commands.Choice(name="Offline", value="offline"),
+    ]
+)
+@app_commands.default_permissions(administrator=True)
+async def status_panel_bot(interaction: discord.Interaction, status: app_commands.Choice[str]):
+    data["config"]["panels_online"] = status.value == "online"
+    save(data)
+    await apply_presence()
+    if status.value == "online":
+        text = "🟢 Panels are now **online**. All buttons work again."
+    else:
+        text = "🔴 Panels are now **offline**. Only **Get Stats** can be used."
+    await interaction.response.send_message(text, ephemeral=True)
+    await log_event(
+        "📡 Panel status changed",
+        f"{interaction.user.mention} set the panels to **{status.name}**.",
+        discord.Color.green() if status.value == "online" else discord.Color.red(),
+    )
+
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} ({bot.user.id})")
+    await apply_presence()
 
 
 bot.run(TOKEN)
