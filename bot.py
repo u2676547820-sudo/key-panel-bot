@@ -1,3 +1,4 @@
+import hmac
 import io
 import json
 import os
@@ -9,6 +10,7 @@ from pathlib import Path
 
 import discord
 from discord import app_commands
+from aiohttp import web
 from discord.ext import commands, tasks
 
 TOKEN = os.getenv("DISCORD_TOKEN", "YOUR_BOT_TOKEN_HERE")
@@ -17,6 +19,8 @@ HWID_COOLDOWN = 24 * 60 * 60  # seconds between HWID resets
 BRAND = "BananaHub"
 # Admins are never punished for leaks unless you set EXEMPT_ADMINS=false (for testing)
 EXEMPT_ADMINS = os.getenv("EXEMPT_ADMINS", "true").lower() != "false"
+# Secret for the Windows admin app (min. 16 chars). Without it the API stays disabled.
+API_KEY = os.getenv("ADMIN_API_KEY", "")
 
 DURATIONS = {
     "daily": 24 * 3600,
@@ -77,13 +81,18 @@ def panels_online() -> bool:
 
 async def apply_presence():
     """Show the panel status in the bot's Discord presence."""
-    if panels_online():
-        await bot.change_presence(status=discord.Status.online, activity=None)
-    else:
-        await bot.change_presence(
-            status=discord.Status.dnd,
-            activity=discord.Game(name="Panels offline"),
-        )
+    try:
+        if panels_online():
+            await bot.change_presence(status=discord.Status.online, activity=None)
+        elif data["config"].get("invisible_when_offline"):
+            await bot.change_presence(status=discord.Status.invisible, activity=None)
+        else:
+            await bot.change_presence(
+                status=discord.Status.dnd,
+                activity=discord.Game(name="Panels offline"),
+            )
+    except Exception:
+        pass  # not connected yet
 
 
 async def strip_roles(user_id: int, only_panel: str | None = None):
@@ -600,6 +609,7 @@ class Bot(commands.Bot):
         for name in data["panels"]:
             self.add_view(PanelView(name))
         expiry_loop.start()
+        await start_api()
         await self.tree.sync()
         print(
             f"Loaded {len(data['panels'])} panels, {len(data['keys'])} keys, "
@@ -1293,6 +1303,470 @@ async def status_panel_bot(interaction: discord.Interaction, status: app_command
         f"{interaction.user.mention} set the panels to **{status.name}**.",
         discord.Color.green() if status.value == "online" else discord.Color.red(),
     )
+
+
+# ----------------------------- admin API (for the Windows app) ---------
+FAILED_AUTH: dict[str, list[float]] = {}
+API_RUNNER: web.AppRunner | None = None
+
+
+def api_ok(**kw):
+    return web.json_response({"ok": True, **kw})
+
+
+def api_err(msg: str, status: int = 400):
+    return web.json_response({"ok": False, "error": msg}, status=status)
+
+
+def client_ip(request: web.Request) -> str:
+    fwd = request.headers.get("X-Forwarded-For")
+    return fwd.split(",")[0].strip() if fwd else (request.remote or "?")
+
+
+@web.middleware
+async def auth_middleware(request: web.Request, handler):
+    if request.path == "/health":
+        return await handler(request)
+    ip = client_ip(request)
+    now = time.time()
+    fails = [t for t in FAILED_AUTH.get(ip, []) if now - t < 600]
+    FAILED_AUTH[ip] = fails
+    if len(fails) >= 10:
+        return api_err("Too many failed attempts. Try again in 10 minutes.", 429)
+    header = request.headers.get("Authorization", "")
+    token = header[7:] if header.startswith("Bearer ") else ""
+    if not token or not hmac.compare_digest(token.encode(), API_KEY.encode()):
+        fails.append(now)
+        FAILED_AUTH[ip] = fails
+        return api_err("Unauthorized", 401)
+    try:
+        return await handler(request)
+    except web.HTTPException:
+        raise
+    except Exception as e:  # never leak a traceback to the client
+        return api_err(f"{type(e).__name__}: {e}", 500)
+
+
+async def body(request: web.Request) -> dict:
+    try:
+        b = await request.json()
+    except Exception:
+        return {}
+    return b if isinstance(b, dict) else {}
+
+
+def to_int(v):
+    try:
+        return int(str(v).strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def plain_status(entry: dict) -> str:
+    if entry.get("banned"):
+        return "banned"
+    if entry.get("deleted"):
+        return "deleted"
+    if entry["used_by"] is not None:
+        return "redeemed"
+    return "unused"
+
+
+def compute_stats() -> dict:
+    now = time.time()
+    active = {t: 0 for t in DURATIONS}
+    expiring = 0
+    redeemed_week = 0
+    for panels in data["users"].values():
+        for lic in panels.values():
+            if lic.get("redeemed_at", 0) > now - 7 * 86400:
+                redeemed_week += 1
+            if lic.get("deleted"):
+                continue
+            exp = lic.get("expires_at")
+            if exp and exp < now:
+                continue
+            t = lic.get("duration", "lifetime")
+            active[t] = active.get(t, 0) + 1
+            if exp and exp - now < 86400:
+                expiring += 1
+    pending = sum(1 for a in data["appeals"].values() if a.get("status") == "pending")
+    return {
+        "active": active,
+        "expiring_24h": expiring,
+        "redeemed_7d": redeemed_week,
+        "pending_appeals": pending,
+    }
+
+
+async def h_health(request):
+    return web.json_response({"ok": True})
+
+
+async def h_dashboard(request):
+    lat = bot.latency
+    keys = data["keys"].values()
+    return api_ok(
+        panels_online=panels_online(),
+        invisible_when_offline=bool(data["config"].get("invisible_when_offline")),
+        bot_ready=bot.is_ready(),
+        bot_user=str(bot.user) if bot.user else None,
+        latency_ms=None if lat != lat else round(lat * 1000),
+        uptime=int(time.time() - START_TIME),
+        guilds=[{"id": str(g.id), "name": g.name} for g in bot.guilds],
+        panels=len(data["panels"]),
+        keys_total=len(data["keys"]),
+        keys_redeemed=sum(1 for k in keys if k["used_by"] is not None),
+        keys_banned=sum(1 for k in keys if k.get("banned")),
+        banned_users=len(data["banned"]),
+        log_channel=str(data["config"].get("log_channel") or ""),
+        stats=compute_stats(),
+    )
+
+
+async def h_set_status(request):
+    b = await body(request)
+    if "online" not in b:
+        return api_err("Missing 'online'.")
+    data["config"]["panels_online"] = bool(b["online"])
+    if "invisible_when_offline" in b:
+        data["config"]["invisible_when_offline"] = bool(b["invisible_when_offline"])
+    save(data)
+    await apply_presence()
+    state = "Online" if panels_online() else "Offline"
+    await log_event(
+        "📡 Panel status changed",
+        f"The admin app set the panels to **{state}**.",
+        discord.Color.green() if panels_online() else discord.Color.red(),
+    )
+    return api_ok(panels_online=panels_online())
+
+
+async def h_panels(request):
+    out = []
+    for name, p in data["panels"].items():
+        keys = [k for k in data["keys"].values() if k["panel"] == name]
+        role_name = None
+        for g in bot.guilds:
+            r = g.get_role(p.get("role_id") or 0)
+            if r:
+                role_name = r.name
+                break
+        out.append({
+            "name": name,
+            "description": p["description"],
+            "role_id": str(p.get("role_id") or ""),
+            "role_name": role_name,
+            "keys": len(keys),
+            "unused": sum(1 for k in keys if plain_status(k) == "unused"),
+            "redeemed": sum(1 for k in keys if plain_status(k) == "redeemed"),
+            "banned": sum(1 for k in keys if plain_status(k) == "banned"),
+            "deleted": sum(1 for k in keys if plain_status(k) == "deleted"),
+        })
+    return api_ok(panels=out)
+
+
+async def h_panel_create(request):
+    b = await body(request)
+    name = str(b.get("name", "")).strip()
+    desc = str(b.get("description", "")).strip()
+    script = str(b.get("script", ""))
+    role_id = to_int(b.get("role_id"))
+    if not name or not desc or not script.strip() or role_id is None:
+        return api_err("name, description, script and role_id are required.")
+    if name in data["panels"]:
+        return api_err("A panel with that name already exists.")
+    data["panels"][name] = {"description": desc, "script": script, "role_id": role_id}
+    save(data)
+    bot.add_view(PanelView(name))
+    await log_event("🧩 Panel created", f"Admin app created panel **{name}**.")
+    return api_ok()
+
+
+async def h_panel_delete(request):
+    b = await body(request)
+    name = str(b.get("name", ""))
+    if name not in data["panels"]:
+        return api_err("Unknown panel.")
+    del data["panels"][name]
+    data["keys"] = {k: v for k, v in data["keys"].items() if v["panel"] != name}
+    for up in data["users"].values():
+        up.pop(name, None)
+    save(data)
+    await log_event("🗑️ Panel deleted", f"Admin app deleted panel **{name}**.", discord.Color.orange())
+    return api_ok()
+
+
+async def h_panel_send(request):
+    b = await body(request)
+    name = str(b.get("name", ""))
+    cid = to_int(b.get("channel_id"))
+    if name not in data["panels"]:
+        return api_err("Unknown panel.")
+    if cid is None:
+        return api_err("channel_id is required.")
+    channel = bot.get_channel(cid)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(cid)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return api_err("Channel not found (or the bot cannot see it).")
+    try:
+        await channel.send(embed=build_panel_embed(name), view=PanelView(name))
+    except discord.Forbidden:
+        return api_err("The bot may not send messages in that channel.")
+    await log_event("📤 Panel sent", f"Admin app posted **{name}** in {channel.mention}.")
+    return api_ok()
+
+
+async def h_keys_create(request):
+    b = await body(request)
+    panel = str(b.get("panel", ""))
+    duration = str(b.get("duration", "")).lower()
+    amount = to_int(b.get("amount")) or 1
+    user_id = to_int(b.get("user_id")) if str(b.get("user_id", "")).strip() else None
+    if panel not in data["panels"]:
+        return api_err("Unknown panel.")
+    if duration not in DURATIONS:
+        return api_err("duration must be daily, weekly, monthly or lifetime.")
+    if not 1 <= amount <= 100:
+        return api_err("amount must be between 1 and 100.")
+    if str(b.get("user_id", "")).strip() and user_id is None:
+        return api_err("user_id must be a number.")
+    keys = []
+    for _ in range(amount):
+        key = "-".join(secrets.token_hex(2).upper() for _ in range(4))
+        data["keys"][key] = {
+            "panel": panel, "used_by": None, "duration": duration,
+            "locked_to": user_id, "banned": False, "created_at": int(time.time()),
+        }
+        keys.append(key)
+    save(data)
+    await log_event(
+        "🔑 Keys created",
+        f"Admin app created **{amount}x {duration.capitalize()}** key(s) for **{panel}**"
+        + (f", locked to <@{user_id}>." if user_id else "."),
+    )
+    return api_ok(keys=keys)
+
+
+async def h_keys_list(request):
+    panel = request.query.get("panel", "all")
+    status = request.query.get("status", "all")
+    out = []
+    for key, e in data["keys"].items():
+        if panel != "all" and e["panel"] != panel:
+            continue
+        st = plain_status(e)
+        if status != "all" and st != status:
+            continue
+        out.append({
+            "key": key, "panel": e["panel"], "duration": e.get("duration", "lifetime"),
+            "status": st, "used_by": str(e["used_by"] or ""),
+            "locked_to": str(e.get("locked_to") or ""), "created_at": e.get("created_at"),
+        })
+    out.sort(key=lambda x: x["created_at"] or 0, reverse=True)
+    return api_ok(keys=out)
+
+
+async def h_keys_revoke(request):
+    b = await body(request)
+    key = str(b.get("key", "")).strip()
+    entry = data["keys"].get(key)
+    if not entry:
+        return api_err("Key not found.")
+    if entry["used_by"] is not None:
+        return api_err("That key is already redeemed. Use 'Delete key' with user + panel instead.")
+    del data["keys"][key]
+    save(data)
+    await log_event("🗑️ Unused key removed", f"Admin app removed the unused key `{key[:4]}…`.", discord.Color.orange())
+    return api_ok()
+
+
+async def h_user_info(request):
+    b = await body(request)
+    uid = to_int(b.get("user_id"))
+    if uid is None:
+        return api_err("user_id must be a number.")
+    name = None
+    try:
+        name = str(await bot.fetch_user(uid))
+    except Exception:
+        pass
+    lics = []
+    for pname, lic in data["users"].get(str(uid), {}).items():
+        lics.append({
+            "panel": pname, "key": lic["key"], "duration": lic.get("duration", "lifetime"),
+            "expires_at": lic.get("expires_at"), "redeemed_at": lic.get("redeemed_at"),
+            "deleted": bool(lic.get("deleted")), "hwid_reset_at": lic.get("hwid_reset_at", 0),
+        })
+    return api_ok(user=name, banned=data["banned"].get(str(uid)), licenses=lics)
+
+
+def _find_license(b: dict):
+    uid = to_int(b.get("user_id"))
+    panel = str(b.get("panel", ""))
+    if uid is None:
+        return None, None, "user_id must be a number."
+    if panel not in data["panels"]:
+        return None, None, "Unknown panel."
+    lic = get_license(uid, panel)
+    if not lic or lic.get("deleted"):
+        return None, None, "That user has no active key on this panel."
+    return uid, lic, None
+
+
+async def h_user_deletekey(request):
+    b = await body(request)
+    uid, lic, err = _find_license(b)
+    if err:
+        return api_err(err)
+    panel = str(b["panel"])
+    lic["deleted"] = True
+    lic["deleted_at"] = int(time.time())
+    entry = data["keys"].get(lic["key"])
+    if entry:
+        entry["deleted"] = True
+    save(data)
+    await strip_roles(uid, only_panel=panel)
+    await log_event("🗑️ Key deleted", f"Admin app deleted the key of <@{uid}> on **{panel}**.", discord.Color.orange())
+    return api_ok()
+
+
+async def h_user_extend(request):
+    b = await body(request)
+    uid, lic, err = _find_license(b)
+    if err:
+        return api_err(err)
+    days = to_int(b.get("days"))
+    if not days or not 1 <= days <= 3650:
+        return api_err("days must be between 1 and 3650.")
+    if not lic.get("expires_at"):
+        return api_err("That is a Lifetime key - nothing to extend.")
+    lic["expires_at"] = int(max(lic["expires_at"], time.time()) + days * 86400)
+    lic["role_removed"] = False
+    save(data)
+    await log_event("⏩ Key extended", f"Admin app extended <@{uid}>'s key by {days} day(s).")
+    return api_ok(expires_at=lic["expires_at"])
+
+
+async def h_user_resethwid(request):
+    b = await body(request)
+    uid, lic, err = _find_license(b)
+    if err:
+        return api_err(err)
+    lic["hwid"] = None
+    lic["hwid_reset_at"] = 0
+    save(data)
+    await log_event("🔄 HWID reset (admin)", f"Admin app reset the HWID of <@{uid}>.", discord.Color.orange())
+    return api_ok()
+
+
+async def h_user_ban(request):
+    b = await body(request)
+    uid = to_int(b.get("user_id"))
+    if uid is None:
+        return api_err("user_id must be a number.")
+    reason = str(b.get("reason") or "No reason given")
+    ban_user_keys(uid, reason)
+    await strip_roles(uid)
+    extra = ""
+    if b.get("ban_from_server"):
+        gid = to_int(b.get("guild_id"))
+        guild = bot.get_guild(gid) if gid else (bot.guilds[0] if len(bot.guilds) == 1 else None)
+        if guild is None:
+            return api_err("Keys were banned, but I need a valid guild_id to ban from the server.")
+        await dm_banned(uid, guild, reason)  # DM first, then ban
+        try:
+            await guild.ban(discord.Object(id=uid), reason=f"{BRAND}: {reason}", delete_message_days=0)
+            extra = " and banned from the server"
+        except (discord.Forbidden, discord.HTTPException):
+            extra = " (could not ban from server - missing permission)"
+    await log_event("🔨 Key ban", f"Admin app banned <@{uid}>{extra}.\nReason: {reason}", discord.Color.red())
+    return api_ok(message=f"Keys banned{extra}.")
+
+
+async def h_user_unban(request):
+    b = await body(request)
+    uid = to_int(b.get("user_id"))
+    if uid is None:
+        return api_err("user_id must be a number.")
+    lift_user_ban(uid)
+    extra = ""
+    if b.get("unban_from_server"):
+        gid = to_int(b.get("guild_id"))
+        guild = bot.get_guild(gid) if gid else (bot.guilds[0] if len(bot.guilds) == 1 else None)
+        if guild is not None:
+            try:
+                await guild.unban(discord.Object(id=uid), reason=f"{BRAND}: unbanned via admin app")
+                extra = " and unbanned from the server"
+            except discord.NotFound:
+                extra = " (was not banned on the server)"
+            except (discord.Forbidden, discord.HTTPException):
+                extra = " (could not unban from server - missing permission)"
+    await log_event("✅ Key unban", f"Admin app lifted the ban of <@{uid}>{extra}.", discord.Color.green())
+    return api_ok(message=f"Key ban lifted{extra}.")
+
+
+async def h_backup(request):
+    return api_ok(data=data)
+
+
+async def h_restore(request):
+    b = await body(request)
+    new = b.get("data")
+    if not isinstance(new, dict) or not all(k in new for k in ("panels", "keys", "users")):
+        return api_err("That is not a valid backup.")
+    data.clear()
+    data.update(new)
+    for k in ("panels", "keys", "users", "banned", "config", "appeals"):
+        data.setdefault(k, {})
+    save(data)
+    for name in data["panels"]:
+        bot.add_view(PanelView(name))
+    await apply_presence()
+    await log_event("♻️ Data restored", "Admin app restored a backup.", discord.Color.orange())
+    return api_ok(panels=len(data["panels"]), keys=len(data["keys"]))
+
+
+def make_api_app() -> web.Application:
+    app = web.Application(middlewares=[auth_middleware], client_max_size=10 * 1024 * 1024)
+    app.add_routes([
+        web.get("/health", h_health),
+        web.get("/api/dashboard", h_dashboard),
+        web.post("/api/status", h_set_status),
+        web.get("/api/panels", h_panels),
+        web.post("/api/panels/create", h_panel_create),
+        web.post("/api/panels/delete", h_panel_delete),
+        web.post("/api/panels/send", h_panel_send),
+        web.post("/api/keys/create", h_keys_create),
+        web.get("/api/keys/list", h_keys_list),
+        web.post("/api/keys/revoke", h_keys_revoke),
+        web.post("/api/users/info", h_user_info),
+        web.post("/api/users/deletekey", h_user_deletekey),
+        web.post("/api/users/extend", h_user_extend),
+        web.post("/api/users/resethwid", h_user_resethwid),
+        web.post("/api/users/ban", h_user_ban),
+        web.post("/api/users/unban", h_user_unban),
+        web.get("/api/backup", h_backup),
+        web.post("/api/restore", h_restore),
+    ])
+    return app
+
+
+async def start_api():
+    global API_RUNNER
+    if not API_KEY:
+        print("Admin API disabled (set ADMIN_API_KEY to enable the Windows app).")
+        return
+    if len(API_KEY) < 16:
+        print("Admin API disabled: ADMIN_API_KEY must be at least 16 characters.")
+        return
+    port = int(os.getenv("PORT", "8080"))
+    API_RUNNER = web.AppRunner(make_api_app())
+    await API_RUNNER.setup()
+    await web.TCPSite(API_RUNNER, "0.0.0.0", port).start()
+    print(f"Admin API listening on port {port}")
 
 
 @bot.event
