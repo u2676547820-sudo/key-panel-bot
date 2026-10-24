@@ -1,3 +1,5 @@
+import asyncio
+import hashlib
 import hmac
 import io
 import json
@@ -37,7 +39,7 @@ def load() -> dict:
     d = {}
     if DATA_FILE.exists():
         d = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-    for k in ("panels", "keys", "users", "banned", "config", "appeals"):
+    for k in ("panels", "keys", "users", "banned", "config", "appeals", "stock", "tickets", "purchase_codes"):
         d.setdefault(k, {})
     return d
 
@@ -47,6 +49,32 @@ def save(d: dict) -> None:
 
 
 data = load()
+
+
+# ------------------------------------------------------- admin app login --
+def hash_password(password: str, salt: str) -> str:
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000).hex()
+
+
+def set_admin_password(password: str):
+    salt = secrets.token_hex(16)
+    data["config"]["admin_password_salt"] = salt
+    data["config"]["admin_password_hash"] = hash_password(password, salt)
+    save(data)
+
+
+def clear_admin_password():
+    data["config"].pop("admin_password_salt", None)
+    data["config"].pop("admin_password_hash", None)
+    save(data)
+
+
+def verify_admin_password(password: str) -> bool:
+    salt = data["config"].get("admin_password_salt")
+    stored = data["config"].get("admin_password_hash")
+    if not salt or not stored:
+        return False
+    return hmac.compare_digest(hash_password(password, salt), stored)
 
 
 def get_license(user_id: int, panel: str):
@@ -597,6 +625,212 @@ async def dm_banned(user_id: int, guild: discord.Guild, reason: str) -> bool:
         return False
 
 
+# ----------------------------------------------------------- stock system --
+def stock_count(category: str) -> int:
+    return len(data["stock"].get(category, {}).get("items", []))
+
+
+def stock_categories_text() -> str:
+    if not data["stock"]:
+        return "No products yet."
+    lines = []
+    for name, cat in data["stock"].items():
+        price = f" - {cat['price']}" if cat.get("price") else ""
+        lines.append(f"**{name}**{price}: {len(cat['items'])} in stock")
+    return "\n".join(lines)
+
+
+def is_staff(member: discord.Member) -> bool:
+    if member.guild_permissions.administrator:
+        return True
+    role_id = data["config"].get("staff_role_id")
+    return bool(role_id and any(r.id == role_id for r in member.roles))
+
+
+def build_stock_panel_embed() -> discord.Embed:
+    desc = data["config"].get("stock_panel_description", "Browse our stock below.")
+    embed = discord.Embed(title="🛒 Shop", description=desc, color=discord.Color.blurple())
+    embed.add_field(name="📦 Current stock", value=stock_categories_text(), inline=False)
+    embed.set_footer(text=f"{BRAND} • Have a purchase code? Use Redeem Key.")
+    return embed
+
+
+class RedeemCodeModal(discord.ui.Modal, title="Redeem Purchase Code"):
+    code_input = discord.ui.TextInput(label="Your code", placeholder="XXXX-XXXX-XXXX", min_length=4, max_length=64)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        code = self.code_input.value.strip().upper()
+        entry = data["purchase_codes"].get(code)
+        if entry is None:
+            return await interaction.response.send_message("❌ Invalid code.", ephemeral=True)
+        if entry.get("redeemed"):
+            return await interaction.response.send_message("❌ This code has already been redeemed.", ephemeral=True)
+        if entry.get("locked_to") and entry["locked_to"] != interaction.user.id:
+            return await interaction.response.send_message("❌ This code belongs to another user.", ephemeral=True)
+
+        entry["redeemed"] = True
+        entry["redeemed_by"] = interaction.user.id
+        entry["redeemed_at"] = int(time.time())
+        save(data)
+        await interaction.response.send_message(
+            f"✅ **{entry['category']}** delivered:\n```\n{entry['details']}\n```\n"
+            "Save this now - it will not be shown again here.",
+            ephemeral=True,
+        )
+        await log_event(
+            "💸 Purchase code redeemed",
+            f"{interaction.user.mention} redeemed a code for **{entry['category']}**.",
+            discord.Color.green(),
+        )
+
+
+class BuySelect(discord.ui.Select):
+    def __init__(self):
+        options = []
+        for name, cat in data["stock"].items():
+            count = len(cat["items"])
+            options.append(discord.SelectOption(
+                label=name[:100], description=f"{count} in stock" + (f" • {cat['price']}" if cat.get("price") else ""),
+                value=name, emoji="📦" if count else "🚫",
+            ))
+        if not options:
+            options = [discord.SelectOption(label="No products available", value="__none__")]
+        super().__init__(placeholder="Choose what you want to buy...", options=options[:25], custom_id="buyselect")
+
+    async def callback(self, interaction: discord.Interaction):
+        choice = self.values[0]
+        if choice == "__none__":
+            return await interaction.response.send_message("❌ Nothing is for sale right now.", ephemeral=True)
+        cat = data["stock"].get(choice)
+        if not cat:
+            return await interaction.response.send_message("❌ That product no longer exists.", ephemeral=True)
+        ticket = data["tickets"].get(str(interaction.channel.id))
+        if ticket is None:
+            return await interaction.response.send_message("❌ This isn't an active ticket.", ephemeral=True)
+        ticket["category"] = choice
+        save(data)
+        price = f" - **{cat['price']}**" if cat.get("price") else ""
+        embed = discord.Embed(
+            title="🛍️ Order selected",
+            description=f"**{choice}**{price}\nIn stock: {len(cat['items'])}\n\n"
+                        "A staff member will claim this ticket shortly to arrange payment and delivery.",
+            color=discord.Color.blurple(),
+        )
+        self.disabled = True
+        await interaction.response.edit_message(view=self.view)
+        await interaction.followup.send(embed=embed, view=TicketActionView())
+
+
+class BuySelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(BuySelect())
+
+
+class TicketActionView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Claim", style=discord.ButtonStyle.success, emoji="🙋", custom_id="ticket:claim")
+    async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_staff(interaction.user):
+            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        ticket = data["tickets"].get(str(interaction.channel.id))
+        if ticket is None:
+            return await interaction.response.send_message("❌ This isn't an active ticket.", ephemeral=True)
+        if ticket.get("claimed_by"):
+            return await interaction.response.send_message(
+                f"⚠️ Already claimed by <@{ticket['claimed_by']}>.", ephemeral=True
+            )
+        ticket["claimed_by"] = interaction.user.id
+        save(data)
+        button.disabled = True
+        button.label = f"Claimed"
+        await interaction.response.edit_message(view=self)
+        cat = ticket.get("category")
+        hint = f" Use `/deliverstock` here to deliver the next **{cat}** once paid." if cat else ""
+        await interaction.channel.send(f"🙋 Claimed by {interaction.user.mention}.{hint}")
+
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, emoji="🔒", custom_id="ticket:close")
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        ticket = data["tickets"].get(str(interaction.channel.id))
+        opener_id = ticket.get("opened_by") if ticket else None
+        if not (is_staff(interaction.user) or interaction.user.id == opener_id):
+            return await interaction.response.send_message("❌ Only staff or the ticket opener can close this.", ephemeral=True)
+        await interaction.response.send_message("🔒 Closing this ticket in 5 seconds...")
+        data["tickets"].pop(str(interaction.channel.id), None)
+        save(data)
+        await log_event("🔒 Ticket closed", f"{interaction.user.mention} closed {interaction.channel.mention}.", discord.Color.orange())
+        await asyncio.sleep(5)
+        try:
+            await interaction.channel.delete(reason=f"{BRAND}: ticket closed")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+
+class StockPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Redeem Key", style=discord.ButtonStyle.success, emoji="🔑", custom_id="stockpanel:redeem")
+    async def redeem(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(RedeemCodeModal())
+
+    @discord.ui.button(label="Stock", style=discord.ButtonStyle.secondary, emoji="📦", custom_id="stockpanel:stock")
+    async def stock(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(title="📦 Current stock", description=stock_categories_text(),
+                              color=discord.Color.blurple())
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Buy", style=discord.ButtonStyle.primary, emoji="🛒", custom_id="stockpanel:buy")
+    async def buy(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        if str(interaction.user.id) in data["banned"]:
+            return await interaction.response.send_message("🚫 You are banned from using this service.", ephemeral=True)
+        for ch_id, t in data["tickets"].items():
+            if t.get("opened_by") == interaction.user.id:
+                ch = guild.get_channel(int(ch_id))
+                if ch:
+                    return await interaction.response.send_message(
+                        f"⚠️ You already have an open ticket: {ch.mention}", ephemeral=True
+                    )
+        await interaction.response.defer(ephemeral=True)
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
+        }
+        staff_role_id = data["config"].get("staff_role_id")
+        if staff_role_id:
+            role = guild.get_role(staff_role_id)
+            if role:
+                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+        category_id = data["config"].get("ticket_category_id")
+        category_ch = guild.get_channel(category_id) if category_id else None
+        try:
+            channel = await guild.create_text_channel(
+                name=f"order-{interaction.user.name}"[:90], overwrites=overwrites,
+                category=category_ch, reason=f"{BRAND}: new order ticket",
+            )
+        except discord.Forbidden:
+            return await interaction.followup.send(
+                "❌ I don't have permission to create ticket channels here.", ephemeral=True
+            )
+        data["tickets"][str(channel.id)] = {
+            "opened_by": interaction.user.id, "category": None,
+            "claimed_by": None, "created_at": int(time.time()),
+        }
+        save(data)
+        embed = discord.Embed(
+            title="🛍️ New order",
+            description=f"Welcome {interaction.user.mention}! Pick a product below to get started.",
+            color=discord.Color.blurple(),
+        )
+        await channel.send(embed=embed, view=BuySelectView())
+        await interaction.followup.send(f"✅ Ticket opened: {channel.mention}", ephemeral=True)
+        await log_event("🛒 Ticket opened", f"{interaction.user.mention} opened {channel.mention}.")
+
+
 # ----------------------------- bot -------------------------------------
 class Bot(commands.Bot):
     def __init__(self):
@@ -608,6 +842,9 @@ class Bot(commands.Bot):
         self.add_dynamic_items(AppealButton, DecisionButton, OrphanPanelButton)
         for name in data["panels"]:
             self.add_view(PanelView(name))
+        self.add_view(StockPanelView())
+        self.add_view(BuySelectView())
+        self.add_view(TicketActionView())
         expiry_loop.start()
         await start_api()
         await self.tree.sync()
@@ -839,6 +1076,36 @@ async def set_log_channel(interaction: discord.Interaction, channel: discord.Tex
     data["config"]["log_channel"] = channel.id
     save(data)
     await interaction.response.send_message(f"✅ Log channel set to {channel.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="setadminpassword", description="Set the login password for the Windows admin app")
+@app_commands.describe(password="The new login password (shown only to you)")
+@app_commands.default_permissions(administrator=True)
+async def set_admin_password_cmd(interaction: discord.Interaction, password: str):
+    if len(password) < 6:
+        return await interaction.response.send_message(
+            "❌ Please use at least 6 characters.", ephemeral=True
+        )
+    set_admin_password(password)
+    await interaction.response.send_message(
+        "✅ Admin app login password set. Open the Windows app, enter the bot URL and this "
+        "password on the Login screen.\n⚠️ This message is only visible to you — the password "
+        "is not stored anywhere else in Discord.",
+        ephemeral=True,
+    )
+    await log_event("🔐 Admin password changed", f"{interaction.user.mention} set a new login password.")
+
+
+@bot.tree.command(name="removeadminpassword", description="Disable login for the Windows admin app")
+@app_commands.default_permissions(administrator=True)
+async def remove_admin_password_cmd(interaction: discord.Interaction):
+    clear_admin_password()
+    await interaction.response.send_message(
+        "✅ Login password removed. Nobody can log into the admin app until you set a new one "
+        "with `/setadminpassword`.", ephemeral=True,
+    )
+    await log_event("🔐 Admin password removed", f"{interaction.user.mention} disabled the admin app login.",
+                    discord.Color.orange())
 
 
 @bot.tree.command(name="createkey", description="Generate keys for a panel")
@@ -1266,7 +1533,7 @@ async def restore(interaction: discord.Interaction, file: discord.Attachment):
         return await interaction.followup.send("❌ That is not a valid backup file.", ephemeral=True)
     data.clear()
     data.update(new)
-    for k in ("panels", "keys", "users", "banned", "config", "appeals"):
+    for k in ("panels", "keys", "users", "banned", "config", "appeals", "stock", "tickets", "purchase_codes"):
         data.setdefault(k, {})
     save(data)
     for name in data["panels"]:
@@ -1325,7 +1592,7 @@ def client_ip(request: web.Request) -> str:
 
 @web.middleware
 async def auth_middleware(request: web.Request, handler):
-    if request.path == "/health":
+    if request.path in ("/health", "/api/login"):  # these verify their own credentials
         return await handler(request)
     ip = client_ip(request)
     now = time.time()
@@ -1403,6 +1670,31 @@ async def h_health(request):
     return web.json_response({"ok": True})
 
 
+async def h_login(request):
+    """Exchange the Discord-set login password for the real API key.
+    Not Bearer-protected (the caller doesn't have the key yet), so it enforces
+    its own brute-force limit using the same FAILED_AUTH ledger."""
+    ip = client_ip(request)
+    now = time.time()
+    fails = [t for t in FAILED_AUTH.get(ip, []) if now - t < 600]
+    FAILED_AUTH[ip] = fails
+    if len(fails) >= 10:
+        return api_err("Too many failed attempts. Try again in 10 minutes.", 429)
+    if not API_KEY:
+        return api_err("The bot's admin API is not configured (missing ADMIN_API_KEY).", 503)
+
+    b = await body(request)
+    password = str(b.get("password", ""))
+    if not data["config"].get("admin_password_hash"):
+        return api_err("No login password set yet. An admin must run /setadminpassword on Discord first.", 400)
+    if not password or not verify_admin_password(password):
+        fails.append(now)
+        FAILED_AUTH[ip] = fails
+        return api_err("Incorrect password.", 401)
+    FAILED_AUTH.pop(ip, None)  # a correct login clears this IP's earlier failed attempts
+    return api_ok(api_key=API_KEY)
+
+
 async def h_dashboard(request):
     lat = bot.latency
     keys = data["keys"].values()
@@ -1420,6 +1712,7 @@ async def h_dashboard(request):
         keys_banned=sum(1 for k in keys if k.get("banned")),
         banned_users=len(data["banned"]),
         log_channel=str(data["config"].get("log_channel") or ""),
+        login_configured=bool(data["config"].get("admin_password_hash")),
         stats=compute_stats(),
     )
 
@@ -1719,7 +2012,7 @@ async def h_restore(request):
         return api_err("That is not a valid backup.")
     data.clear()
     data.update(new)
-    for k in ("panels", "keys", "users", "banned", "config", "appeals"):
+    for k in ("panels", "keys", "users", "banned", "config", "appeals", "stock", "tickets", "purchase_codes"):
         data.setdefault(k, {})
     save(data)
     for name in data["panels"]:
@@ -1733,6 +2026,7 @@ def make_api_app() -> web.Application:
     app = web.Application(middlewares=[auth_middleware], client_max_size=10 * 1024 * 1024)
     app.add_routes([
         web.get("/health", h_health),
+        web.post("/api/login", h_login),
         web.get("/api/dashboard", h_dashboard),
         web.post("/api/status", h_set_status),
         web.get("/api/panels", h_panels),
@@ -1767,6 +2061,185 @@ async def start_api():
     await API_RUNNER.setup()
     await web.TCPSite(API_RUNNER, "0.0.0.0", port).start()
     print(f"Admin API listening on port {port}")
+
+
+async def stock_category_autocomplete(interaction: discord.Interaction, current: str):
+    return [
+        app_commands.Choice(name=f"{name} ({len(c['items'])} in stock)", value=name)
+        for name, c in data["stock"].items() if current.lower() in name.lower()
+    ][:25]
+
+
+@bot.tree.command(name="addstock", description="Add one stock item to a product (creates it if new)")
+@app_commands.describe(
+    category="Product name, e.g. 'Fortnite Acc OG'",
+    details="The secret info delivered to the buyer (account:pass, key, etc.)",
+    price="Shown on the panel, e.g. '$15' (only needed the first time)",
+)
+@app_commands.autocomplete(category=stock_category_autocomplete)
+@app_commands.default_permissions(administrator=True)
+async def add_stock(interaction: discord.Interaction, category: str, details: str, price: str = ""):
+    cat = data["stock"].setdefault(category, {"description": "", "price": "", "items": []})
+    if price:
+        cat["price"] = price
+    item_id = secrets.token_hex(4)
+    cat["items"].append({"id": item_id, "details": details, "added_at": int(time.time())})
+    save(data)
+    await interaction.response.send_message(
+        f"✅ Added 1 item to **{category}**. Now in stock: **{len(cat['items'])}**.", ephemeral=True
+    )
+    await log_event("📦 Stock added", f"{interaction.user.mention} added 1 item to **{category}**.")
+
+
+@bot.tree.command(name="addstockbulk", description="Add many stock items at once from a .txt file (one per line)")
+@app_commands.describe(category="Product name", file="A .txt file, one item per line", price="Shown on the panel")
+@app_commands.autocomplete(category=stock_category_autocomplete)
+@app_commands.default_permissions(administrator=True)
+async def add_stock_bulk(interaction: discord.Interaction, category: str, file: discord.Attachment, price: str = ""):
+    if file.size > 1_000_000 or not file.filename.lower().endswith(".txt"):
+        return await interaction.response.send_message("❌ Upload a .txt file under 1 MB.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        lines = [l.strip() for l in (await file.read()).decode("utf-8", errors="ignore").splitlines() if l.strip()]
+    except (discord.HTTPException, UnicodeDecodeError):
+        return await interaction.followup.send("❌ Could not read that file.", ephemeral=True)
+    if not lines:
+        return await interaction.followup.send("❌ That file is empty.", ephemeral=True)
+    cat = data["stock"].setdefault(category, {"description": "", "price": "", "items": []})
+    if price:
+        cat["price"] = price
+    now = int(time.time())
+    for line in lines:
+        cat["items"].append({"id": secrets.token_hex(4), "details": line, "added_at": now})
+    save(data)
+    await interaction.followup.send(
+        f"✅ Added **{len(lines)}** items to **{category}**. Now in stock: **{len(cat['items'])}**.", ephemeral=True
+    )
+    await log_event("📦 Stock added", f"{interaction.user.mention} bulk-added {len(lines)} items to **{category}**.")
+
+
+@bot.tree.command(name="removestock", description="Remove one unclaimed item from a product")
+@app_commands.describe(category="Product name", item_id="The short id shown in /liststock (leave empty for 'any one')")
+@app_commands.autocomplete(category=stock_category_autocomplete)
+@app_commands.default_permissions(administrator=True)
+async def remove_stock(interaction: discord.Interaction, category: str, item_id: str = ""):
+    cat = data["stock"].get(category)
+    if not cat or not cat["items"]:
+        return await interaction.response.send_message(f"❌ **{category}** has no stock.", ephemeral=True)
+    if item_id:
+        before = len(cat["items"])
+        cat["items"] = [i for i in cat["items"] if i["id"] != item_id]
+        if len(cat["items"]) == before:
+            return await interaction.response.send_message("❌ No item with that id.", ephemeral=True)
+    else:
+        cat["items"].pop(0)
+    save(data)
+    await interaction.response.send_message(
+        f"🗑️ Removed. **{category}** now has **{len(cat['items'])}** in stock.", ephemeral=True
+    )
+
+
+@bot.tree.command(name="liststock", description="List every product and how many items are in stock")
+@app_commands.default_permissions(administrator=True)
+async def list_stock(interaction: discord.Interaction):
+    if not data["stock"]:
+        return await interaction.response.send_message("ℹ️ No products yet. Add one with `/addstock`.", ephemeral=True)
+    embed = discord.Embed(title="📦 Stock overview", color=discord.Color.blurple())
+    for name, cat in data["stock"].items():
+        ids = ", ".join(i["id"] for i in cat["items"][:10]) or "-"
+        more = f" (+{len(cat['items']) - 10} more)" if len(cat["items"]) > 10 else ""
+        embed.add_field(
+            name=f"{name} - {cat.get('price') or 'no price set'}",
+            value=f"**{len(cat['items'])}** in stock\nIds: `{ids}`{more}",
+            inline=False,
+        )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="setupstockpanel", description="Post (or refresh) the shop panel in this channel")
+@app_commands.describe(description="Text shown at the top of the shop panel")
+@app_commands.default_permissions(administrator=True)
+async def setup_stock_panel(interaction: discord.Interaction, description: str = "Browse our stock below."):
+    data["config"]["stock_panel_description"] = description
+    save(data)
+    try:
+        await interaction.channel.send(embed=build_stock_panel_embed(), view=StockPanelView())
+    except discord.Forbidden:
+        return await interaction.response.send_message(
+            "❌ I can't send messages in this channel.", ephemeral=True
+        )
+    await interaction.response.send_message("✅ Shop panel posted.", ephemeral=True)
+    await log_event("🛒 Shop panel posted", f"{interaction.user.mention} posted the shop panel.")
+
+
+@bot.tree.command(name="setstaffrole", description="Set the role that can claim tickets and deliver stock")
+@app_commands.describe(role="The staff role")
+@app_commands.default_permissions(administrator=True)
+async def set_staff_role(interaction: discord.Interaction, role: discord.Role):
+    data["config"]["staff_role_id"] = role.id
+    save(data)
+    await interaction.response.send_message(f"✅ Staff role set to {role.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="setticketcategory", description="Set the Discord category channel where tickets are created")
+@app_commands.describe(category="The category channel for new ticket channels")
+@app_commands.default_permissions(administrator=True)
+async def set_ticket_category(interaction: discord.Interaction, category: discord.CategoryChannel):
+    data["config"]["ticket_category_id"] = category.id
+    save(data)
+    await interaction.response.send_message(f"✅ New tickets will be created under **{category.name}**.", ephemeral=True)
+
+
+@bot.tree.command(name="addpurchasecode", description="Create a redeemable code that instantly delivers one stock item")
+@app_commands.describe(category="Product to deliver", user="Optional: only this user may redeem it")
+@app_commands.autocomplete(category=stock_category_autocomplete)
+@app_commands.default_permissions(administrator=True)
+async def add_purchase_code(interaction: discord.Interaction, category: str, user: discord.User | None = None):
+    cat = data["stock"].get(category)
+    if not cat or not cat["items"]:
+        return await interaction.response.send_message(f"❌ **{category}** has no stock to reserve.", ephemeral=True)
+    item = cat["items"].pop(0)
+    save(data)
+    code = "-".join(secrets.token_hex(2).upper() for _ in range(3))
+    data["purchase_codes"][code] = {
+        "category": category, "details": item["details"], "locked_to": user.id if user else None,
+        "redeemed": False, "created_at": int(time.time()),
+    }
+    save(data)
+    target = f" (locked to {user.mention})" if user else ""
+    await interaction.response.send_message(
+        f"✅ Code for **{category}**{target}:\n```\n{code}\n```\n"
+        "Give this to the buyer - they redeem it with the **Redeem Key** button on the shop panel.",
+        ephemeral=True,
+    )
+    await log_event("💳 Purchase code created", f"{interaction.user.mention} created a code for **{category}**.")
+
+
+@bot.tree.command(name="deliverstock", description="Deliver the next item of a product in this ticket")
+@app_commands.describe(category="Which product to deliver (defaults to the one picked in this ticket)")
+@app_commands.autocomplete(category=stock_category_autocomplete)
+async def deliver_stock(interaction: discord.Interaction, category: str = ""):
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+    ticket = data["tickets"].get(str(interaction.channel.id))
+    category = category or (ticket.get("category") if ticket else "")
+    if not category:
+        return await interaction.response.send_message(
+            "❌ No product selected. Run this in a ticket, or pass `category`.", ephemeral=True
+        )
+    cat = data["stock"].get(category)
+    if not cat or not cat["items"]:
+        return await interaction.response.send_message(f"❌ **{category}** is out of stock.", ephemeral=True)
+    item = cat["items"].pop(0)
+    save(data)
+    await interaction.response.send_message(
+        f"📦 **{category}** delivered by {interaction.user.mention}:\n```\n{item['details']}\n```"
+    )
+    await log_event(
+        "📦 Stock delivered",
+        f"{interaction.user.mention} delivered 1x **{category}** in {interaction.channel.mention}.",
+        discord.Color.green(),
+    )
 
 
 @bot.event
